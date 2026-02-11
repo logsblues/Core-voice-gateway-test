@@ -997,7 +997,16 @@ class SupabaseClient {
           session.preloadedContact.name = prep.contact_name;
           session.preloadedContact.safeName = BusinessNameDetector.getSafeContactName(prep.contact_name);
         }
-        logger.info("Prep loaded from call_prep_sessions", { prepId, hasInstructions: !!session.dynamicInstructions });
+        // NEW v7.1: Interpreter mode fields
+        if (prep.call_mode) session.callMode = prep.call_mode;
+        if (prep.interpreter_enabled) session.interpreterEnabled = prep.interpreter_enabled;
+        if (prep.interpreter_mode) session.interpreterMode = prep.interpreter_mode;
+        if (prep.agent_language) session.agentLanguage = prep.agent_language;
+        if (prep.customer_language) session.customerLanguage = prep.customer_language;
+        if (prep.tts_voice_agent) session.ttsVoiceAgent = prep.tts_voice_agent;
+        if (prep.tts_voice_customer) session.ttsVoiceCustomer = prep.tts_voice_customer;
+        if (prep.glossary_json) session.glossaryJson = prep.glossary_json;
+        logger.info("Prep loaded from call_prep_sessions", { prepId, hasInstructions: !!session.dynamicInstructions, callMode: session.callMode || "ai_agent" });
         return;
       }
 
@@ -1008,7 +1017,16 @@ class SupabaseClient {
         session.dynamicInstructions = bcPrep.dynamic_instructions || session.dynamicInstructions;
         session.language = bcPrep.language || session.language;
         if (bcPrep.first_message) session.dynamicFirstMessage = bcPrep.first_message;
-        logger.info("Prep loaded from bc_call_prep_sessions", { prepId });
+        // NEW v7.1: Interpreter mode fields
+        if (bcPrep.call_mode) session.callMode = bcPrep.call_mode;
+        if (bcPrep.interpreter_enabled) session.interpreterEnabled = bcPrep.interpreter_enabled;
+        if (bcPrep.interpreter_mode) session.interpreterMode = bcPrep.interpreter_mode;
+        if (bcPrep.agent_language) session.agentLanguage = bcPrep.agent_language;
+        if (bcPrep.customer_language) session.customerLanguage = bcPrep.customer_language;
+        if (bcPrep.tts_voice_agent) session.ttsVoiceAgent = bcPrep.tts_voice_agent;
+        if (bcPrep.tts_voice_customer) session.ttsVoiceCustomer = bcPrep.tts_voice_customer;
+        if (bcPrep.glossary_json) session.glossaryJson = bcPrep.glossary_json;
+        logger.info("Prep loaded from bc_call_prep_sessions", { prepId, callMode: session.callMode || "ai_agent" });
       }
     } catch (e) {
       logger.error("Prep session load error", { prepId, error: e.message });
@@ -2406,6 +2424,57 @@ class TwilioHandler {
       session.playbook = playbook;
     }
 
+    // ==================== INTERPRETER MODE CHECK ====================
+    if (session.callMode === "interpreter" && session.interpreterEnabled) {
+      logger.info("Interpreter mode activated", {
+        callSid: session.callSid,
+        agentLang: session.agentLanguage || "es",
+        customerLang: session.customerLanguage || "en",
+        mode: session.interpreterMode || "bidirectional"
+      });
+
+      // Override system prompt for interpreter mode
+      const agentLang = session.agentLanguage || "es";
+      const customerLang = session.customerLanguage || "en";
+      const interpreterMode = session.interpreterMode || "bidirectional";
+
+      const interpreterPrompt = `You are a real-time voice interpreter. Your ONLY job is to translate speech between two humans on a phone call.
+
+CRITICAL RULES:
+- You are NOT an AI assistant. Do NOT answer questions, give opinions, or add any content.
+- Translate EXACTLY what is said. Do not summarize, interpret meaning, or add context.
+- Maintain the speaker's tone, formality level, and intent.
+- If you cannot understand something, say "Could you please repeat that?" in the appropriate language.
+- NEVER speak on your own initiative. Only translate what you hear.
+
+LANGUAGE PAIR:
+- Leg A (Operator): speaks ${agentLang === "es" ? "Spanish" : agentLang === "en" ? "English" : agentLang}
+- Leg B (Customer): speaks ${customerLang === "es" ? "Spanish" : customerLang === "en" ? "English" : customerLang}
+
+TRANSLATION DIRECTION:
+${interpreterMode === "bidirectional" ? 
+  `- When you hear ${agentLang}, translate to ${customerLang}
+- When you hear ${customerLang}, translate to ${agentLang}` :
+  interpreterMode === "agent_to_customer_only" ?
+  `- Only translate from ${agentLang} to ${customerLang}. Ignore speech in ${customerLang}.` :
+  `- Only translate from ${customerLang} to ${agentLang}. Ignore speech in ${agentLang}.`}
+
+${session.glossaryJson ? `GLOSSARY (use these exact translations):\n${JSON.stringify(session.glossaryJson)}` : ""}
+
+OUTPUT FORMAT:
+- Speak the translation naturally and clearly.
+- Match the speaking pace of the original speaker.
+- Use the same register (formal/informal) as the original.`;
+
+      session.config.systemPrompt = interpreterPrompt;
+      session.config.firstMessage = null; // No greeting in interpreter mode
+      session.dynamicFirstMessage = null;
+      session.skipGreeting = true;
+
+      // Use appropriate voice for the customer side (they hear the translation)
+      session.config.voice = VoiceMapper.mapToOpenAI(session.ttsVoiceCustomer || session.config.voice || DEFAULT_VOICE);
+    }
+
     // Register session by callSid and create call record
     sessions.set(session.callSid, session);
     this._createCallRecord(session);
@@ -3029,6 +3098,7 @@ server.listen(PORT, () => {
 â•‘  âœ… Configurable AI model (from bc_agents)                â•‘
 â•‘  âœ… Dynamic temperature / max_tokens                      â•‘
 â•‘  âœ… Cache invalidation endpoint                           â•‘
+â•‘  âœ… Real-Time Interpreter mode (ESâ†”EN)                    â•‘
 â•‘                                                           â•‘
 â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
   `);
