@@ -1,7 +1,7 @@
 {
-  "name": "render-voice-gateway-v4",
-  "version": "4.26.1",
-  "description": "Render Voice Gateway v4.26.1 - ESM version of stable v4.26",
+  "name": "render-voice-gateway-v7",
+  "version": "7.0.0",
+  "description": "VoicesCore Voice Gateway v7.0.0 - Enterprise Edition with Dynamic Tools, ElevenLabs TTS, Playbooks, Tool Logging, Configurable STT/AI",
   "type": "module",
   "main": "index.js",
   "scripts": {
