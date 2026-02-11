@@ -1,28 +1,36 @@
 /**
  * ============================================================
- * VOICE GATEWAY v6.2.0 â€” ENTERPRISE EDITION (Blue Core Ready)
+ * VOICE GATEWAY v7.0.0 â€” ENTERPRISE EDITION (Blue Core Ready)
  * ============================================================
  *
- * Complete OOP architecture merging:
- * - v6.0.0 Enterprise infrastructure (22 classes, resilience, observability)
- * - v6.1.0 Blue Core business logic (bc_agents, dynB64, fmB64, forceNewSession,
- *   business name detection, response locking, greeting system)
+ * Complete OOP architecture based on v6.2.0 with NEW v7 features:
+ * - v6.2.0 Full codebase (22 classes, resilience, observability)
+ * - v7.0.0 NEW: Dynamic Tools from DB (bc_agent_tools)
+ * - v7.0.0 NEW: ElevenLabs TTS support (stability, similarity_boost, style, speed)
+ * - v7.0.0 NEW: Playbooks injection (bc_agent_playbooks)
+ * - v7.0.0 NEW: Tool call logging (persisted to bc_call_prep_sessions.tool_calls_log)
+ * - v7.0.0 NEW: Configurable STT (stt_provider, stt_language from bc_agents)
+ * - v7.0.0 NEW: Configurable AI model (ai_model from bc_agents)
+ * - v7.0.0 NEW: Dynamic temperature / max_tokens (from bc_agents)
  *
  * ARCHITECTURE: 10 clearly separated sections with full OOP encapsulation.
  *
- * CLASSES (22):
+ * CLASSES (27 â€” 22 original + 5 new):
  *   Utilities:    Logger, Validator, Parser
  *   Resilience:   RetryManager, CircuitBreaker, RateLimiter
  *   State:        SessionManager
- *   External:     SupabaseClient, CRMToolsClient, WebhookClient
+ *   External:     SupabaseClient, CRMToolsClient, WebhookClient,
+ *                 ElevenLabsTTSClient (NEW v7)
  *   Business:     LanguageDetector, VoicemailDetector, AutoHangupManager,
  *                 SpamFilter, ToolDeduplicator, PromptBuilder, VoiceMapper,
- *                 BusinessNameDetector, ResponseLockManager
+ *                 BusinessNameDetector, ResponseLockManager,
+ *                 DynamicToolLoader (NEW v7), PlaybookLoader (NEW v7),
+ *                 ToolCallLogger (NEW v7)
  *   Execution:    ToolExecutor
  *   Handlers:     OpenAIHandler, TwilioHandler
  *   Observability: MetricsCollector, HealthCheck
  *
- * KEY FEATURES:
+ * KEY FEATURES (v6.2.0 inherited):
  * - Multi-tenant architecture (zero hardcoded company logic)
  * - Circuit breakers & exponential backoff for all external services
  * - Automatic language detection with dynamic switching
@@ -43,11 +51,21 @@
  * - Blue Core (bc_agents, bc_companies, bc_call_prep_sessions) support
  * - Full exports for testing
  *
+ * NEW FEATURES (v7.0.0):
+ * - Dynamic tool loading from bc_agent_tools with 5min cache
+ * - ElevenLabs TTS with full voice_settings support
+ * - Playbook injection from bc_agent_playbooks (opening_script, qualifying_questions, objection_handlers)
+ * - Tool call logging persisted to bc_call_prep_sessions.tool_calls_log
+ * - Configurable STT provider/language/model from bc_agents
+ * - Configurable AI model from bc_agents (ai_model field)
+ * - Dynamic temperature/max_tokens from bc_agents
+ * - Cache invalidation endpoint (POST /cache/invalidate)
+ *
  * BLUE CORE TEST DATA:
  *   Company: bc000000-0000-0000-0000-000000000001 (Blue Core, sandbox)
  *   Agent:   bc000000-0000-0000-0000-000000000002 (Nanyeli, es, openai voice)
  *
- * @version 6.2.0
+ * @version 7.0.0
  * @license MIT
  */
 
@@ -58,7 +76,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "6.2.0";
+const VERSION = "7.0.0";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -69,6 +87,7 @@ const VOICE_GATEWAY_TOKEN = process.env.VOICE_GATEWAY_TOKEN;
 
 // Environment variables (optional)
 const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";  // NEW v7
 const ENABLE_WEBHOOKS = process.env.ENABLE_WEBHOOKS !== "false";
 const ENABLE_METRICS = process.env.ENABLE_METRICS !== "false";
 
@@ -99,6 +118,10 @@ const CIRCUIT_BREAKER_RESET_TIMEOUT_MS = 60000;
 const RATE_LIMIT_CALLS_PER_TENANT_CONCURRENT = 50;
 const RATE_LIMIT_CALLS_PER_TENANT_HOUR = 1000;
 const RATE_LIMIT_REQUESTS_PER_IP_MINUTE = 60;
+
+// Cache constants (NEW v7)
+const TOOL_CACHE_TTL_MS = 5 * 60 * 1000;    // 5 minutes
+const PLAYBOOK_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 // Default values
 const DEFAULT_TIMEZONE = "America/New_York";
@@ -173,7 +196,6 @@ const NEVER_DEDUP_TOOLS = [
   "schedule_appointment", "transfer_to_human", "end_call",
   "create_lead", "create_or_merge_contact", "take_note"
 ];
-
 
 // ============================================================
 // SECTION 2: UTILITIES
@@ -358,9 +380,9 @@ logger.info("Voice Gateway starting", {
   version: VERSION,
   port: PORT,
   webhooksEnabled: ENABLE_WEBHOOKS,
-  metricsEnabled: ENABLE_METRICS
+  metricsEnabled: ENABLE_METRICS,
+  elevenLabsEnabled: !!ELEVENLABS_API_KEY
 });
-
 
 // ============================================================
 // SECTION 3: RESILIENCE
@@ -483,6 +505,7 @@ class CircuitBreaker {
 const supabaseCircuit = new CircuitBreaker("Supabase", { failureThreshold: 3, resetTimeout: 30000 });
 const openaiCircuit = new CircuitBreaker("OpenAI", { failureThreshold: 5, resetTimeout: 60000 });
 const crmToolsCircuit = new CircuitBreaker("CRM_Tools", { failureThreshold: 5, resetTimeout: 60000 });
+const elevenLabsCircuit = new CircuitBreaker("ElevenLabs", { failureThreshold: 3, resetTimeout: 60000 }); // NEW v7
 
 /**
  * RateLimiter - Rate limiting per tenant and per IP
@@ -543,7 +566,6 @@ class RateLimiter {
   }
 }
 
-
 // ============================================================
 // SECTION 4: STATE MANAGEMENT
 // ============================================================
@@ -581,10 +603,18 @@ class SessionManager {
       // Conversational state
       transcripts: { user: [], assistant: [] },
       toolCalls: [],
+      toolCallLog: [],  // NEW v7: persistent tool call log
       preloadedContact: config.preloadedContact || null,
       dynamicInstructions: config.dynamicInstructions || null,
       dynamicInstructionsMode: config.dynamicInstructionsMode || "addon",
       dynamicFirstMessage: config.dynamicFirstMessage || null,
+
+      // NEW v7: Dynamic tools and playbook
+      dynamicTools: null,
+      playbook: null,
+
+      // NEW v7: Agent extended config
+      agentExtendedConfig: null,
 
       // Flags
       sessionCreated: false,
@@ -655,6 +685,10 @@ class SessionManager {
       if (session.companyId) {
         RateLimiter.decrementTenantCalls(session.companyId);
       }
+      // NEW v7: Persist tool call logs before deleting
+      ToolCallLogger.persist(session).catch(e =>
+        logger.error("Tool log persist failed on delete", { error: e.message })
+      );
       sessions.delete(sessionId);
       logger.info("Session deleted", {
         sessionId, callSid: session.callSid,
@@ -761,7 +795,6 @@ function cleanupExpiredPrewarmSessions() {
 
 setInterval(cleanupExpiredPrewarmSessions, PREWARM_CLEANUP_INTERVAL_MS);
 
-
 // ============================================================
 // SECTION 5: EXTERNAL SERVICES
 // ============================================================
@@ -816,6 +849,7 @@ class SupabaseClient {
 
   /**
    * Multi-source agent config loader: agents_new â†’ autoprompt â†’ ai_agents â†’ bc_agents
+   * ENHANCED v7: Also loads ai_model, ai_temperature, ai_max_tokens, stt_*, voice_provider, elevenlabs_* from bc_agents
    */
   static async loadAgentConfig(agentId, companyId) {
     const cacheKey = agentId + "_" + (companyId || "");
@@ -834,6 +868,20 @@ class SupabaseClient {
       companyTimezone: DEFAULT_TIMEZONE,
       humanAgents: [],
       webhook_url: null,
+      // NEW v7 fields
+      voiceProvider: "openai",
+      elevenlabsVoiceId: null,
+      elevenlabsStability: 0.5,
+      elevenlabsSimilarityBoost: 0.75,
+      elevenlabsStyle: 0.0,
+      elevenlabsSpeed: 1.0,
+      elevenlabsModelId: "eleven_turbo_v2_5",
+      aiModel: OPENAI_REALTIME_MODEL,
+      aiTemperature: 0.8,
+      aiMaxTokens: 4096,
+      sttProvider: "openai",
+      sttLanguage: "es",
+      sttModel: "whisper-1",
       _ts: Date.now()
     };
 
@@ -866,15 +914,37 @@ class SupabaseClient {
         }
       }
 
-      // 4. Try bc_agents (Blue Core sandbox)
+      // 4. Try bc_agents (Blue Core sandbox) â€” ENHANCED v7 with extended fields
       if (config.systemPrompt === "You are a helpful assistant.") {
         const bcRes = await this.request("bc_agents?id=eq." + agentId + "&select=*");
         if (bcRes.ok && bcRes.data?.[0]) {
           const bcAgent = bcRes.data[0];
           config.systemPrompt = bcAgent.system_prompt_base || config.systemPrompt;
-          config.voice = VoiceMapper.mapToOpenAI(bcAgent.voice_provider || DEFAULT_VOICE);
-          config.language = bcAgent.language_default || config.language;
-          logger.info("Agent loaded from bc_agents", { agentId });
+          config.voice = VoiceMapper.mapToOpenAI(bcAgent.openai_voice || bcAgent.voice_provider || DEFAULT_VOICE);
+          config.language = bcAgent.language_default || bcAgent.language || config.language;
+          config.firstMessage = config.firstMessage || bcAgent.first_message;
+
+          // NEW v7: Extended bc_agents fields
+          config.voiceProvider = bcAgent.voice_provider || "openai";
+          config.elevenlabsVoiceId = bcAgent.elevenlabs_voice_id || null;
+          config.elevenlabsStability = bcAgent.elevenlabs_stability ?? 0.5;
+          config.elevenlabsSimilarityBoost = bcAgent.elevenlabs_similarity_boost ?? 0.75;
+          config.elevenlabsStyle = bcAgent.elevenlabs_style ?? 0.0;
+          config.elevenlabsSpeed = bcAgent.elevenlabs_speed ?? 1.0;
+          config.elevenlabsModelId = bcAgent.elevenlabs_model_id || "eleven_turbo_v2_5";
+          config.aiModel = bcAgent.ai_model || OPENAI_REALTIME_MODEL;
+          config.aiTemperature = bcAgent.ai_temperature ?? 0.8;
+          config.aiMaxTokens = bcAgent.ai_max_tokens ?? 4096;
+          config.sttProvider = bcAgent.stt_provider || "openai";
+          config.sttLanguage = bcAgent.stt_language || config.language;
+          config.sttModel = bcAgent.stt_model || "whisper-1";
+
+          logger.info("Agent loaded from bc_agents", {
+            agentId,
+            voiceProvider: config.voiceProvider,
+            aiModel: config.aiModel,
+            sttProvider: config.sttProvider
+          });
         }
       }
 
@@ -937,6 +1007,7 @@ class SupabaseClient {
         const bcPrep = bcRes.data[0];
         session.dynamicInstructions = bcPrep.dynamic_instructions || session.dynamicInstructions;
         session.language = bcPrep.language || session.language;
+        if (bcPrep.first_message) session.dynamicFirstMessage = bcPrep.first_message;
         logger.info("Prep loaded from bc_call_prep_sessions", { prepId });
       }
     } catch (e) {
@@ -1009,7 +1080,7 @@ class CRMToolsClient {
 }
 
 /**
- * WebhookClient - Send post-call webhooks (RESTORED from v6.0)
+ * WebhookClient - Send post-call webhooks
  */
 class WebhookClient {
   static async send(url, payload) {
@@ -1045,13 +1116,223 @@ class WebhookClient {
   }
 }
 
+// ============================================================
+// SECTION 5B: NEW v7 EXTERNAL SERVICES
+// ============================================================
+
+/**
+ * ElevenLabsTTSClient - Text-to-Speech via ElevenLabs API (NEW v7)
+ */
+class ElevenLabsTTSClient {
+  static async synthesize(text, config = {}) {
+    const {
+      voiceId = "JBFqnCBsd6RMkjVDRZzb",
+      stability = 0.5,
+      similarityBoost = 0.75,
+      style = 0.0,
+      speed = 1.0,
+      modelId = "eleven_turbo_v2_5"
+    } = config;
+
+    if (!ELEVENLABS_API_KEY) {
+      throw new Error("ELEVENLABS_API_KEY not configured");
+    }
+
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=ulaw_8000`;
+
+    const response = await elevenLabsCircuit.execute(async () => {
+      return await RetryManager.execute(async () => {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: {
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            text,
+            model_id: modelId,
+            voice_settings: {
+              stability,
+              similarity_boost: similarityBoost,
+              style,
+              use_speaker_boost: true,
+              speed
+            }
+          })
+        });
+        if (!res.ok) {
+          const errText = await res.text();
+          const error = new Error(`ElevenLabs TTS error ${res.status}: ${errText}`);
+          error.status = res.status;
+          throw error;
+        }
+        return res;
+      }, { context: { service: "ElevenLabs TTS" } });
+    });
+
+    const arrayBuf = await response.arrayBuffer();
+    return Buffer.from(arrayBuf);
+  }
+}
+
+/**
+ * DynamicToolLoader - Load tool schemas from bc_agent_tools (NEW v7)
+ */
+class DynamicToolLoader {
+  static cache = new Map();
+
+  static async loadTools(agentId) {
+    const cached = this.cache.get(agentId);
+    if (cached && Date.now() - cached.loadedAt < TOOL_CACHE_TTL_MS) {
+      return cached.tools;
+    }
+
+    try {
+      const res = await SupabaseClient.request(
+        `bc_agent_tools?agent_id=eq.${agentId}&enabled=eq.true&order=priority.asc&select=*`
+      );
+
+      if (!res.ok || !res.data?.length) {
+        logger.info("[DynamicToolLoader] No dynamic tools found, using defaults", { agentId });
+        return null; // null = use hardcoded defaults
+      }
+
+      const tools = res.data.map(t => ({
+        name: t.tool_name,
+        type: t.tool_type || "function",
+        schema: t.schema || null,
+        config: t.config || {},
+        handlerConfig: t.handler_config || {},
+        priority: t.priority || 0
+      }));
+
+      this.cache.set(agentId, { tools, loadedAt: Date.now() });
+      logger.info("[DynamicToolLoader] Loaded tools from DB", { agentId, count: tools.length });
+      return tools;
+    } catch (err) {
+      logger.error("[DynamicToolLoader] Load failed", { agentId, error: err.message });
+      return null;
+    }
+  }
+
+  static invalidateCache(agentId) {
+    if (agentId) {
+      this.cache.delete(agentId);
+    } else {
+      this.cache.clear();
+    }
+  }
+}
+
+/**
+ * PlaybookLoader - Load playbooks from bc_agent_playbooks (NEW v7)
+ */
+class PlaybookLoader {
+  static cache = new Map();
+
+  static async loadPlaybook(agentId, language = "es") {
+    const cacheKey = `${agentId}:${language}`;
+    const cached = this.cache.get(cacheKey);
+    if (cached && Date.now() - cached.loadedAt < PLAYBOOK_CACHE_TTL_MS) {
+      return cached.playbook;
+    }
+
+    try {
+      // Try language-specific first
+      let res = await SupabaseClient.request(
+        `bc_agent_playbooks?agent_id=eq.${agentId}&is_active=eq.true&language=eq.${language}&order=version.desc&limit=1&select=*`
+      );
+
+      let playbookRow = res.ok && res.data?.[0] ? res.data[0] : null;
+
+      // Fallback: any active playbook
+      if (!playbookRow) {
+        res = await SupabaseClient.request(
+          `bc_agent_playbooks?agent_id=eq.${agentId}&is_active=eq.true&order=version.desc&limit=1&select=*`
+        );
+        playbookRow = res.ok && res.data?.[0] ? res.data[0] : null;
+      }
+
+      if (!playbookRow) {
+        logger.info("[PlaybookLoader] No active playbook found", { agentId });
+        return null;
+      }
+
+      const playbook = {
+        openingScript: playbookRow.opening_script || "",
+        qualifyingQuestions: playbookRow.qualifying_questions || [],
+        objectionHandlers: playbookRow.objection_handlers || [],
+        valueProps: playbookRow.value_props || [],
+        ctaLinks: playbookRow.cta_links || [],
+        planRules: playbookRow.plan_rules || [],
+        language: playbookRow.language || "es",
+        version: playbookRow.version || 1
+      };
+
+      this.cache.set(cacheKey, { playbook, loadedAt: Date.now() });
+      logger.info("[PlaybookLoader] Loaded playbook", { agentId, language, version: playbook.version });
+      return playbook;
+    } catch (err) {
+      logger.error("[PlaybookLoader] Load failed", { agentId, error: err.message });
+      return null;
+    }
+  }
+
+  static invalidateCache(agentId) {
+    if (agentId) {
+      for (const key of this.cache.keys()) {
+        if (key.startsWith(agentId)) this.cache.delete(key);
+      }
+    } else {
+      this.cache.clear();
+    }
+  }
+}
+
+/**
+ * ToolCallLogger - Persist tool call logs to bc_call_prep_sessions (NEW v7)
+ */
+class ToolCallLogger {
+  static record(session, toolName, args, result, durationMs) {
+    if (!session.toolCallLog) session.toolCallLog = [];
+    session.toolCallLog.push({
+      tool_name: toolName,
+      arguments: args,
+      result: result,
+      status: result?.success !== false ? "success" : "error",
+      duration_ms: durationMs,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  static async persist(session) {
+    if (!session.prepId || !session.toolCallLog?.length) return;
+
+    try {
+      // Try bc_call_prep_sessions first
+      const res = await SupabaseClient.request(
+        `bc_call_prep_sessions?id=eq.${session.prepId}`,
+        "PATCH",
+        { tool_calls_log: session.toolCallLog }
+      );
+      if (res.ok) {
+        logger.info("[ToolCallLogger] Persisted tool logs", {
+          prepId: session.prepId,
+          count: session.toolCallLog.length
+        });
+      }
+    } catch (err) {
+      logger.error("[ToolCallLogger] Persist failed", { error: err.message });
+    }
+  }
+}
 
 // ============================================================
 // SECTION 6: BUSINESS LOGIC
 // ============================================================
 
 /**
- * BusinessNameDetector - Detect and filter business/placeholder names (from v6.1)
+ * BusinessNameDetector - Detect and filter business/placeholder names
  */
 class BusinessNameDetector {
   static INDICATORS = [
@@ -1193,7 +1474,6 @@ class AutoHangupManager {
   static checkForGoodbye(session, transcript) {
     if (!transcript || session.callEnding) return;
 
-    // Skip goodbye detection on first assistant message (inbound greeting protection)
     if (!session.greetingMessageSent) {
       session.greetingMessageSent = true;
       logger.debug("Skipping goodbye check on first message", { callSid: session.callSid });
@@ -1281,12 +1561,18 @@ class ToolDeduplicator {
 
 /**
  * PromptBuilder - Build enhanced prompts with dynamic instruction support
+ * ENHANCED v7: Now injects playbook data (opening_script, qualifying_questions, objection_handlers)
  */
 class PromptBuilder {
   static build(session, config) {
     // Full dynamic mode â€” replace entire prompt
     if (session.dynamicInstructions && session.dynamicInstructionsMode === "full") {
-      return session.dynamicInstructions;
+      // NEW v7: Even in full mode, append playbook if available
+      let prompt = session.dynamicInstructions;
+      if (session.playbook) {
+        prompt += "\n\n" + this._buildPlaybookSection(session.playbook);
+      }
+      return prompt;
     }
 
     const isOutbound = session.direction === "outbound";
@@ -1321,6 +1607,12 @@ class PromptBuilder {
     parts.push(config.systemPrompt || "You are a helpful assistant.");
     parts.push("");
 
+    // NEW v7: Playbook injection
+    if (session.playbook) {
+      parts.push(this._buildPlaybookSection(session.playbook));
+      parts.push("");
+    }
+
     // Call direction
     if (isOutbound) {
       parts.push("CALL DIRECTION: OUTBOUND â€” YOU initiated this call. Do NOT ask 'how can I help you?'");
@@ -1351,6 +1643,58 @@ class PromptBuilder {
 
     return parts.join("\n");
   }
+
+  /**
+   * NEW v7: Build playbook section for prompt injection
+   */
+  static _buildPlaybookSection(playbook) {
+    const pbParts = [];
+    pbParts.push(`## PLAYBOOK (v${playbook.version || 1})`);
+
+    if (playbook.openingScript) {
+      pbParts.push(`### GUIÃ“N DE APERTURA\n${playbook.openingScript}`);
+    }
+
+    if (playbook.qualifyingQuestions?.length > 0) {
+      const qs = playbook.qualifyingQuestions
+        .map((q, i) => `${i + 1}. ${typeof q === "string" ? q : q.question || JSON.stringify(q)}`)
+        .join("\n");
+      pbParts.push(`### PREGUNTAS DE CALIFICACIÃ“N\n${qs}`);
+    }
+
+    if (playbook.objectionHandlers?.length > 0) {
+      const ohs = playbook.objectionHandlers
+        .map(oh => {
+          if (typeof oh === "string") return `- ${oh}`;
+          return `- **ObjeciÃ³n:** ${oh.objection || oh.trigger || ""}\n  **Respuesta:** ${oh.response || oh.handler || ""}`;
+        })
+        .join("\n");
+      pbParts.push(`### MANEJO DE OBJECIONES\n${ohs}`);
+    }
+
+    if (playbook.valueProps?.length > 0) {
+      const vps = playbook.valueProps
+        .map(v => typeof v === "string" ? `- ${v}` : `- ${v.title || ""}: ${v.description || ""}`)
+        .join("\n");
+      pbParts.push(`### PROPUESTAS DE VALOR\n${vps}`);
+    }
+
+    if (playbook.ctaLinks?.length > 0) {
+      const ctas = playbook.ctaLinks
+        .map(c => typeof c === "string" ? `- ${c}` : `- ${c.label || ""}: ${c.url || ""}`)
+        .join("\n");
+      pbParts.push(`### LINKS / CTAs\n${ctas}`);
+    }
+
+    if (playbook.planRules?.length > 0) {
+      const rules = playbook.planRules
+        .map(r => typeof r === "string" ? `- ${r}` : `- ${JSON.stringify(r)}`)
+        .join("\n");
+      pbParts.push(`### REGLAS DE PLAN\n${rules}`);
+    }
+
+    return pbParts.join("\n\n");
+  }
 }
 
 /**
@@ -1371,13 +1715,13 @@ class VoiceMapper {
   }
 }
 
-
 // ============================================================
 // SECTION 7: TOOL EXECUTION
 // ============================================================
 
 /**
- * ToolExecutor - Execute tools with deduplication, metrics, and response routing
+ * ToolExecutor - Execute tools with deduplication, metrics, logging, and response routing
+ * ENHANCED v7: Adds ToolCallLogger.record() and uses dynamic tool schemas
  */
 class ToolExecutor {
   static getCustomerPhone(session, args) {
@@ -1427,6 +1771,10 @@ class ToolExecutor {
 
     const duration = Date.now() - startTime;
     ToolDeduplicator.recordExecution(session, toolName, args, result);
+
+    // NEW v7: Record to persistent tool call log
+    ToolCallLogger.record(session, toolName, args, result, duration);
+
     logger.info("Tool execution completed", { callSid: session.callSid, toolName, durationMs: duration, success: result?.success !== false });
 
     this._sendToolResult(session, callId, result, toolName);
@@ -1516,7 +1864,45 @@ class ToolExecutor {
     }
   }
 
+  /**
+   * Build tool definitions for OpenAI session.update
+   * ENHANCED v7: Uses dynamic tools from bc_agent_tools if loaded, otherwise hardcoded defaults
+   */
   static buildToolDefinitions(session, config) {
+    // NEW v7: If dynamic tools were loaded from DB, convert them to OpenAI format
+    if (session.dynamicTools?.length > 0) {
+      const tools = session.dynamicTools
+        .filter(t => t.schema)
+        .map(t => {
+          // If schema is already in OpenAI format, use directly
+          if (t.schema.type === "function" && t.schema.function) {
+            return t.schema;
+          }
+          // Wrap in OpenAI format
+          return {
+            type: "function",
+            name: t.name,
+            description: t.schema.description || t.name,
+            parameters: t.schema.parameters || t.schema
+          };
+        });
+
+      // Always ensure end_call and transfer_to_human are available
+      const hasEndCall = tools.some(t => (t.name || t.function?.name) === "end_call");
+      const hasTransfer = tools.some(t => (t.name || t.function?.name) === "transfer_to_human");
+
+      if (!hasEndCall) {
+        tools.push({ type: "function", name: "end_call", description: "End the call politely.", parameters: { type: "object", properties: { reason: { type: "string" }, outcome: { type: "string" }, goodbye_message: { type: "string" } } } });
+      }
+      if (!hasTransfer) {
+        tools.push({ type: "function", name: "transfer_to_human", description: "Transfer call to a human agent.", parameters: { type: "object", properties: { agent_name: { type: "string" }, reason: { type: "string" } }, required: ["reason"] } });
+      }
+
+      logger.info("Using dynamic tools from DB", { count: tools.length });
+      return tools;
+    }
+
+    // Fallback: hardcoded tool definitions (original v6.2.0 behavior)
     const tools = [];
     const hasContact = session.preloadedContact?.name;
     const isDemoCall = session.isDemoCall === true;
@@ -1543,22 +1929,25 @@ class ToolExecutor {
   }
 }
 
-
 // ============================================================
 // SECTION 8: HANDLERS
 // ============================================================
 
 /**
  * OpenAIHandler - Handle OpenAI Realtime API connections and messages
+ * ENHANCED v7: Uses dynamic AI model, temperature, max_tokens, STT config
  */
 class OpenAIHandler {
   static async connect(session) {
     const startTime = Date.now();
 
     try {
+      // NEW v7: Use dynamic AI model from config if available
+      const model = session.config?.aiModel || OPENAI_REALTIME_MODEL;
+
       const ws = await openaiCircuit.execute(async () => {
         return new Promise((resolve, reject) => {
-          const wsUrl = `wss://api.openai.com/v1/realtime?model=${OPENAI_REALTIME_MODEL}`;
+          const wsUrl = `wss://api.openai.com/v1/realtime?model=${model}`;
           const openaiWs = new WebSocket(wsUrl, {
             headers: {
               "Authorization": `Bearer ${OPENAI_API_KEY}`,
@@ -1578,7 +1967,11 @@ class OpenAIHandler {
 
       session.openaiWs = ws;
       session.metrics.t_openai_connected = Date.now();
-      logger.info("OpenAI connected", { callSid: session.callSid || "prewarm", durationMs: Date.now() - startTime });
+      logger.info("OpenAI connected", {
+        callSid: session.callSid || "prewarm",
+        model,
+        durationMs: Date.now() - startTime
+      });
       this.setupMessageHandler(session);
       return ws;
     } catch (error) {
@@ -1675,7 +2068,13 @@ class OpenAIHandler {
 
     ws.on("close", (code, reason) => {
       logger.info("OpenAI connection closed", { callSid: session.callSid || "prewarm", code });
-      if (session.callSid) this.syncTranscripts(session);
+      if (session.callSid) {
+        this.syncTranscripts(session);
+        // NEW v7: Persist tool call logs on close
+        ToolCallLogger.persist(session).catch(e =>
+          logger.error("Tool log persist on close failed", { error: e.message })
+        );
+      }
     });
 
     ws.on("error", (error) => {
@@ -1683,6 +2082,9 @@ class OpenAIHandler {
     });
   }
 
+  /**
+   * ENHANCED v7: sendSessionUpdate now uses dynamic temperature, max_tokens, STT config
+   */
   static sendSessionUpdate(session) {
     if (!session.openaiWs || session.openaiWs.readyState !== WebSocket.OPEN) return;
 
@@ -1698,28 +2100,39 @@ class OpenAIHandler {
     logger.info("Sending session.update", {
       callSid: session.callSid || "prewarm",
       promptSource, promptLength: prompt.length,
-      voice, toolCount: tools.length
+      voice, toolCount: tools.length,
+      aiModel: config.aiModel,
+      temperature: config.aiTemperature,
+      sttModel: config.sttModel
     });
 
     if (session.callSid) session.pendingSessionUpdate = true;
 
+    const sessionConfig = {
+      modalities: ["text", "audio"],
+      voice,
+      instructions: prompt,
+      input_audio_format: "g711_ulaw",
+      output_audio_format: "g711_ulaw",
+      input_audio_transcription: {
+        model: config.sttModel || "whisper-1",
+        language: config.sttLanguage || config.language || DEFAULT_LANGUAGE  // NEW v7
+      },
+      turn_detection: {
+        type: "server_vad",
+        threshold: 0.5,
+        prefix_padding_ms: 300,
+        silence_duration_ms: 500
+      },
+      tools,
+      // NEW v7: Dynamic temperature and max_tokens
+      temperature: config.aiTemperature ?? 0.8,
+      max_response_output_tokens: config.aiMaxTokens ?? 4096
+    };
+
     session.openaiWs.send(JSON.stringify({
       type: "session.update",
-      session: {
-        modalities: ["text", "audio"],
-        voice,
-        instructions: prompt,
-        input_audio_format: "g711_ulaw",
-        output_audio_format: "g711_ulaw",
-        input_audio_transcription: { model: "whisper-1" },
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 500
-        },
-        tools
-      }
+      session: sessionConfig
     }));
   }
 
@@ -1761,6 +2174,7 @@ class OpenAIHandler {
 
 /**
  * TwilioHandler - Handle Twilio Media Streams with full param support
+ * ENHANCED v7: Loads dynamic tools and playbook on call start
  */
 class TwilioHandler {
   static async handleConnection(twilioWs, request) {
@@ -1969,10 +2383,27 @@ class TwilioHandler {
     } else {
       // ==================== COLD START ====================
       logger.info("Cold start â€” no prewarm", { callSid: session.callSid });
-      if (prepId) await SupabaseClient.loadPrepSession(prepId, session);
+      if (prepId) {
+        session.prepId = prepId;
+        await SupabaseClient.loadPrepSession(prepId, session);
+      }
       const config = await SupabaseClient.loadAgentConfig(session.agentId, session.companyId);
       session.config = config;
       session.configReady = true;
+    }
+
+    // NEW v7: Load dynamic tools and playbook
+    const dynamicTools = await DynamicToolLoader.loadTools(session.agentId);
+    if (dynamicTools) {
+      session.dynamicTools = dynamicTools;
+    }
+
+    const playbook = await PlaybookLoader.loadPlaybook(
+      session.agentId,
+      session.language || session.config?.language || DEFAULT_LANGUAGE
+    );
+    if (playbook) {
+      session.playbook = playbook;
     }
 
     // Register session by callSid and create call record
@@ -1984,6 +2415,10 @@ class TwilioHandler {
     if (!session.openaiWs || session.openaiWs.readyState !== WebSocket.OPEN) {
       await OpenAIHandler.connect(session);
     } else {
+      // If prewarm was reused but we loaded new tools/playbook, send session.update
+      if ((session.dynamicTools || session.playbook) && !session.pendingSessionUpdate) {
+        OpenAIHandler.sendSessionUpdate(session);
+      }
       this.tryTriggerGreetingWhenReady(session);
     }
   }
@@ -2032,19 +2467,25 @@ class TwilioHandler {
         const company = session.config?.companyName || "";
         greeting = session.language === "en"
           ? `Hello! This is ${agentName || "a representative"}${company ? " from " + company : ""}. Do you have a moment to talk?`
-          : `\u00A1Hola! Soy ${agentName || "un representante"}${company ? " de " + company : ""}. \u00BFTiene un momento para hablar?`;
+          : `Â¡Hola! Soy ${agentName || "un representante"}${company ? " de " + company : ""}. Â¿Tiene un momento para hablar?`;
       }
 
       if (greeting) {
         logger.info("Outbound greeting", { callSid: session.callSid, greeting: greeting.substring(0, 80) });
-        session.openaiWs.send(JSON.stringify({
-          type: "conversation.item.create",
-          item: { type: "message", role: "user", content: [{ type: "input_text", text: "[CALL CONNECTED - Customer answered. Deliver your opening greeting NOW.]" }] }
-        }));
-        ResponseLockManager.sendResponseCreateSafe(session, {
-          type: "response.create",
-          response: { modalities: ["text", "audio"], instructions: `Say exactly: "${greeting}"` }
-        }, "outbound_greeting");
+
+        // NEW v7: Use ElevenLabs TTS for greeting if configured
+        if (session.config?.voiceProvider === "elevenlabs" && ELEVENLABS_API_KEY) {
+          this._sendElevenLabsGreeting(session, greeting);
+        } else {
+          session.openaiWs.send(JSON.stringify({
+            type: "conversation.item.create",
+            item: { type: "message", role: "user", content: [{ type: "input_text", text: "[CALL CONNECTED - Customer answered. Deliver your opening greeting NOW.]" }] }
+          }));
+          ResponseLockManager.sendResponseCreateSafe(session, {
+            type: "response.create",
+            response: { modalities: ["text", "audio"], instructions: `Say exactly: "${greeting}"` }
+          }, "outbound_greeting");
+        }
       } else {
         session.openaiWs.send(JSON.stringify({
           type: "conversation.item.create",
@@ -2062,19 +2503,25 @@ class TwilioHandler {
         const company = session.config?.companyName || "";
         greeting = session.language === "en"
           ? `Hello! Thank you for calling${company ? " " + company : ""}. How can I help you today?`
-          : `\u00A1Hola! Gracias por llamar${company ? " a " + company : ""}. \u00BFEn qu\u00E9 puedo ayudarle hoy?`;
+          : `Â¡Hola! Gracias por llamar${company ? " a " + company : ""}. Â¿En quÃ© puedo ayudarle hoy?`;
       }
 
       if (greeting) {
         logger.info("Inbound greeting", { callSid: session.callSid, greeting: greeting.substring(0, 80) });
-        session.openaiWs.send(JSON.stringify({
-          type: "conversation.item.create",
-          item: { type: "message", role: "user", content: [{ type: "input_text", text: "[CALL STARTED - Customer is calling in. Greet them immediately.]" }] }
-        }));
-        ResponseLockManager.sendResponseCreateSafe(session, {
-          type: "response.create",
-          response: { modalities: ["text", "audio"], instructions: `Say exactly: "${greeting}"` }
-        }, "inbound_greeting");
+
+        // NEW v7: Use ElevenLabs TTS for greeting if configured
+        if (session.config?.voiceProvider === "elevenlabs" && ELEVENLABS_API_KEY) {
+          this._sendElevenLabsGreeting(session, greeting);
+        } else {
+          session.openaiWs.send(JSON.stringify({
+            type: "conversation.item.create",
+            item: { type: "message", role: "user", content: [{ type: "input_text", text: "[CALL STARTED - Customer is calling in. Greet them immediately.]" }] }
+          }));
+          ResponseLockManager.sendResponseCreateSafe(session, {
+            type: "response.create",
+            response: { modalities: ["text", "audio"], instructions: `Say exactly: "${greeting}"` }
+          }, "inbound_greeting");
+        }
       } else {
         session.openaiWs.send(JSON.stringify({
           type: "conversation.item.create",
@@ -2084,6 +2531,59 @@ class TwilioHandler {
           type: "response.create", response: { modalities: ["text", "audio"] }
         }, "inbound_generic");
       }
+    }
+  }
+
+  /**
+   * NEW v7: Send greeting via ElevenLabs TTS instead of OpenAI
+   */
+  static async _sendElevenLabsGreeting(session, greeting) {
+    try {
+      const config = session.config;
+      const audioBuffer = await ElevenLabsTTSClient.synthesize(greeting, {
+        voiceId: config.elevenlabsVoiceId,
+        stability: config.elevenlabsStability,
+        similarityBoost: config.elevenlabsSimilarityBoost,
+        style: config.elevenlabsStyle,
+        speed: config.elevenlabsSpeed,
+        modelId: config.elevenlabsModelId
+      });
+
+      // Send audio to Twilio (already in ulaw_8000 format)
+      if (session.twilioWs?.readyState === WebSocket.OPEN && session.streamSid) {
+        const base64Audio = audioBuffer.toString("base64");
+        session.twilioWs.send(JSON.stringify({
+          event: "media",
+          streamSid: session.streamSid,
+          media: { payload: base64Audio }
+        }));
+        session.firstAudioSent = true;
+        logger.info("ElevenLabs greeting sent", { callSid: session.callSid });
+      }
+
+      // Also inform OpenAI that greeting was delivered (so it doesn't repeat)
+      if (session.openaiWs?.readyState === WebSocket.OPEN) {
+        session.openaiWs.send(JSON.stringify({
+          type: "conversation.item.create",
+          item: {
+            type: "message", role: "assistant",
+            content: [{ type: "input_text", text: greeting }]
+          }
+        }));
+      }
+    } catch (error) {
+      logger.error("ElevenLabs greeting failed, falling back to OpenAI", {
+        callSid: session.callSid, error: error.message
+      });
+      // Fallback to OpenAI
+      session.openaiWs.send(JSON.stringify({
+        type: "conversation.item.create",
+        item: { type: "message", role: "user", content: [{ type: "input_text", text: "[Deliver your opening greeting NOW.]" }] }
+      }));
+      ResponseLockManager.sendResponseCreateSafe(session, {
+        type: "response.create",
+        response: { modalities: ["text", "audio"], instructions: `Say exactly: "${greeting}"` }
+      }, "elevenlabs_fallback_greeting");
     }
   }
 
@@ -2144,7 +2644,6 @@ class TwilioHandler {
   }
 }
 
-
 // ============================================================
 // SECTION 9: OBSERVABILITY
 // ============================================================
@@ -2166,7 +2665,12 @@ class MetricsCollector {
       timestamp: new Date().toISOString(),
       uptime_seconds: Math.floor(process.uptime()),
       sessions: { active: SessionManager.getActiveSessionCount(), prewarm: SessionManager.getPrewarmSessionCount() },
-      circuits: [supabaseCircuit.getState(), openaiCircuit.getState(), crmToolsCircuit.getState()],
+      circuits: [
+        supabaseCircuit.getState(),
+        openaiCircuit.getState(),
+        crmToolsCircuit.getState(),
+        elevenLabsCircuit.getState()  // NEW v7
+      ],
       tenants: tenantStats.slice(0, 10),
       memory: {
         used_mb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
@@ -2199,6 +2703,11 @@ class HealthCheck {
       status: crmToolsCircuit.getState().state === "OPEN" ? "unhealthy" : "healthy",
       circuit: crmToolsCircuit.getState().state
     };
+    // NEW v7
+    checks.services.elevenlabs = {
+      status: !ELEVENLABS_API_KEY ? "not_configured" : (elevenLabsCircuit.getState().state === "OPEN" ? "unhealthy" : "healthy"),
+      circuit: elevenLabsCircuit.getState().state
+    };
 
     const unhealthyServices = Object.values(checks.services).filter(s => s.status === "unhealthy");
     if (unhealthyServices.length > 0) {
@@ -2208,7 +2717,6 @@ class HealthCheck {
     return checks;
   }
 }
-
 
 // ============================================================
 // SECTION 10: SERVER
@@ -2252,7 +2760,17 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({
         ...health,
         activeSessions: SessionManager.getActiveSessionCount(),
-        prewarmSessions: SessionManager.getPrewarmSessionCount()
+        prewarmSessions: SessionManager.getPrewarmSessionCount(),
+        // NEW v7: Feature flags
+        features: {
+          dynamicTools: true,
+          elevenLabsTTS: !!ELEVENLABS_API_KEY,
+          playbooks: true,
+          toolCallLogging: true,
+          configurableSTT: true,
+          configurableAIModel: true,
+          dynamicTemperature: true
+        }
       }));
       return;
     }
@@ -2286,6 +2804,33 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // NEW v7: POST /cache/invalidate
+    if (path === "/cache/invalidate" && req.method === "POST") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        try {
+          if (VOICE_GATEWAY_TOKEN && req.headers.authorization !== `Bearer ${VOICE_GATEWAY_TOKEN}`) {
+            res.writeHead(401, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Unauthorized" }));
+            return;
+          }
+          const data = JSON.parse(body);
+          const agentId = data.agent_id || data.agentId;
+          DynamicToolLoader.invalidateCache(agentId);
+          PlaybookLoader.invalidateCache(agentId);
+          if (agentId) agentConfigCache.delete(agentId + "_");
+          logger.info("Cache invalidated", { agentId: agentId || "all" });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, invalidated: agentId || "all" }));
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+        }
+      });
+      return;
+    }
+
     // POST /prewarm (protected)
     if (path === "/prewarm" && req.method === "POST") {
       let body = "";
@@ -2310,6 +2855,13 @@ const server = http.createServer(async (req, res) => {
           const config = await SupabaseClient.loadAgentConfig(data.agent_id, data.company_id);
           const prepId = data.prep_id || generatePrepId();
 
+          // NEW v7: Pre-load dynamic tools and playbook during prewarm
+          const dynamicTools = await DynamicToolLoader.loadTools(data.agent_id);
+          const playbook = await PlaybookLoader.loadPlaybook(
+            data.agent_id,
+            data.language || data.contact_language || DEFAULT_LANGUAGE
+          );
+
           // Create a temporary session for prewarm
           const session = {
             sessionId: prepId,
@@ -2330,6 +2882,9 @@ const server = http.createServer(async (req, res) => {
             isDemoCall: data.is_demo === true,
             transcripts: { user: [], assistant: [] },
             toolCalls: [],
+            toolCallLog: [],
+            dynamicTools: dynamicTools || null,  // NEW v7
+            playbook: playbook || null,           // NEW v7
             sessionCreated: false,
             sessionReady: false,
             greetingMessageSent: false,
@@ -2358,7 +2913,6 @@ const server = http.createServer(async (req, res) => {
           let responded = false;
 
           // Listen for session.updated to confirm prewarm is ready
-          const originalHandler = session.openaiWs.listeners("message").pop();
           session.openaiWs.on("message", (msgData) => {
             const event = Parser.safeJsonParse(msgData.toString(), null);
             if (!event) return;
@@ -2377,7 +2931,9 @@ const server = http.createServer(async (req, res) => {
                 success: true,
                 prep_id: prepId,
                 session_ready: true,
-                timing_ms: Date.now() - prewarmStart
+                timing_ms: Date.now() - prewarmStart,
+                dynamic_tools_loaded: !!dynamicTools,
+                playbook_loaded: !!playbook
               }));
             }
           });
@@ -2450,7 +3006,7 @@ server.listen(PORT, () => {
 â•‘  â¤ï¸  Health:  http://localhost:${PORT}/health                â•‘
 â•‘  ðŸ”Œ WebSocket: ws://localhost:${PORT}/twilio-stream          â•‘
 â•‘                                                           â•‘
-â•‘  Architecture: 22 OOP Classes (10 sections)               â•‘
+â•‘  Architecture: 27 OOP Classes (10 sections)               â•‘
 â•‘  âœ… Multi-tenant (agents_new + bc_agents)                 â•‘
 â•‘  âœ… Circuit breakers & exponential backoff                â•‘
 â•‘  âœ… Prewarm with forceNewSession/skipPrewarm              â•‘
@@ -2464,10 +3020,19 @@ server.listen(PORT, () => {
 â•‘  âœ… Graceful shutdown + fatal error handling               â•‘
 â•‘  âœ… Full exports for testing                              â•‘
 â•‘                                                           â•‘
+â•‘  NEW v7.0.0 Features:                                     â•‘
+â•‘  âœ… Dynamic Tools from DB (bc_agent_tools)                â•‘
+â•‘  âœ… ElevenLabs TTS (stability, style, speed)              â•‘
+â•‘  âœ… Playbooks injection (bc_agent_playbooks)              â•‘
+â•‘  âœ… Tool call logging (persistent)                        â•‘
+â•‘  âœ… Configurable STT (provider, language, model)          â•‘
+â•‘  âœ… Configurable AI model (from bc_agents)                â•‘
+â•‘  âœ… Dynamic temperature / max_tokens                      â•‘
+â•‘  âœ… Cache invalidation endpoint                           â•‘
+â•‘                                                           â•‘
 â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
   `);
 });
-
 
 // ============================================================
 // GRACEFUL SHUTDOWN & ERROR HANDLING
@@ -2492,7 +3057,6 @@ process.on("unhandledRejection", (reason, promise) => {
   process.exit(1);
 });
 
-
 // ============================================================
 // EXPORTS FOR TESTING
 // ============================================================
@@ -2513,6 +3077,7 @@ export {
   SupabaseClient,
   CRMToolsClient,
   WebhookClient,
+  ElevenLabsTTSClient,      // NEW v7
   // Business Logic
   BusinessNameDetector,
   LanguageDetector,
@@ -2522,6 +3087,9 @@ export {
   ToolDeduplicator,
   PromptBuilder,
   VoiceMapper,
+  DynamicToolLoader,         // NEW v7
+  PlaybookLoader,            // NEW v7
+  ToolCallLogger,            // NEW v7
   // Execution
   ToolExecutor,
   // Handlers
