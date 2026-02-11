@@ -925,8 +925,8 @@ class SupabaseClient {
           config.firstMessage = config.firstMessage || bcAgent.first_message;
 
           // NEW v7: Extended bc_agents fields
-          config.voiceProvider = bcAgent.voice_provider || "openai";
-          config.elevenlabsVoiceId = bcAgent.elevenlabs_voice_id || null;
+          config.voiceProvider = bcAgent.voice_provider || bcAgent.tts_provider || "openai";
+          config.elevenlabsVoiceId = bcAgent.elevenlabs_voice_id || bcAgent.tts_voice || null;
           config.elevenlabsStability = bcAgent.elevenlabs_stability ?? 0.5;
           config.elevenlabsSimilarityBoost = bcAgent.elevenlabs_similarity_boost ?? 0.75;
           config.elevenlabsStyle = bcAgent.elevenlabs_style ?? 0.0;
