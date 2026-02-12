@@ -929,12 +929,17 @@ class SupabaseClient {
       }
 
       // 4. Try bc_agents (Blue Core sandbox) â€” ENHANCED v7 with extended fields
-      if (config.systemPrompt === "You are a helpful assistant.") {
+      // ALWAYS check bc_agents for voice/config overrides, even if prompt was loaded from autoprompt
+      {
         const bcRes = await this.request("bc_agents?id=eq." + agentId + "&select=*");
         if (bcRes.ok && bcRes.data?.[0]) {
           const bcAgent = bcRes.data[0];
-          config.systemPrompt = bcAgent.system_prompt_base || config.systemPrompt;
-          config.voice = VoiceMapper.mapToOpenAI(bcAgent.tts_voice || bcAgent.openai_voice || DEFAULT_VOICE);
+          // Only override prompt if not already loaded from a better source
+          if (config.systemPrompt === "You are a helpful assistant.") {
+            config.systemPrompt = bcAgent.system_prompt_base || config.systemPrompt;
+          }
+          // ALWAYS apply voice and extended config from bc_agents (highest priority)
+          config.voice = VoiceMapper.mapToOpenAI(bcAgent.tts_voice || bcAgent.openai_voice || config.voice);
           config.language = bcAgent.language_default || bcAgent.language || config.language;
           config.firstMessage = config.firstMessage || bcAgent.first_message;
 
@@ -955,6 +960,7 @@ class SupabaseClient {
 
           logger.info("Agent loaded from bc_agents", {
             agentId,
+            voice: config.voice,
             voiceProvider: config.voiceProvider,
             aiModel: config.aiModel,
             sttProvider: config.sttProvider
@@ -2962,7 +2968,14 @@ const server = http.createServer(async (req, res) => {
           const agentId = data.agent_id || data.agentId;
           DynamicToolLoader.invalidateCache(agentId);
           PlaybookLoader.invalidateCache(agentId);
-          if (agentId) agentConfigCache.delete(agentId + "_");
+          // v7.1.1: Clear ALL cache entries for this agent (any companyId variant)
+          if (agentId) {
+            for (const key of agentConfigCache.keys()) {
+              if (key.startsWith(agentId)) agentConfigCache.delete(key);
+            }
+          } else {
+            agentConfigCache.clear();
+          }
           logger.info("Cache invalidated", { agentId: agentId || "all" });
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true, invalidated: agentId || "all" }));
