@@ -1,17 +1,18 @@
 /**
  * ============================================================
- * VOICE GATEWAY v7.0.0 â€” ENTERPRISE EDITION (Blue Core Ready)
+ * VOICE GATEWAY v7.1.0 â€” ENTERPRISE EDITION (Blue Core Ready)
  * ============================================================
  *
- * Complete OOP architecture based on v6.2.0 with NEW v7 features:
- * - v6.2.0 Full codebase (22 classes, resilience, observability)
- * - v7.0.0 NEW: Dynamic Tools from DB (bc_agent_tools)
- * - v7.0.0 NEW: ElevenLabs TTS support (stability, similarity_boost, style, speed)
- * - v7.0.0 NEW: Playbooks injection (bc_agent_playbooks)
- * - v7.0.0 NEW: Tool call logging (persisted to bc_call_prep_sessions.tool_calls_log)
- * - v7.0.0 NEW: Configurable STT (stt_provider, stt_language from bc_agents)
- * - v7.0.0 NEW: Configurable AI model (ai_model from bc_agents)
- * - v7.0.0 NEW: Dynamic temperature / max_tokens (from bc_agents)
+ * Complete OOP architecture based on v7.0.0 with v7.1.0 fixes:
+ * - v7.0.0 Full codebase (27 classes, resilience, observability)
+ * - v7.1.0 FIX: Interpreter cross-routing for dual-leg calls
+ *   â†’ Audio from Session A now routes to Session B's Twilio stream
+ *   â†’ Audio from Session B now routes to Session A's Twilio stream
+ *   â†’ Both parties hear each other's translated speech
+ * - v7.1.0 NEW: interpreterPartners Map for session linking by prepId
+ * - v7.1.0 NEW: interpreterLeg param (agent/customer) from TwiML
+ * - v7.1.0 NEW: Partner cleanup on session delete
+ *
  *
  * ARCHITECTURE: 10 clearly separated sections with full OOP encapsulation.
  *
@@ -65,7 +66,7 @@
  *   Company: bc000000-0000-0000-0000-000000000001 (Blue Core, sandbox)
  *   Agent:   bc000000-0000-0000-0000-000000000002 (Nanyeli, es, openai voice)
  *
- * @version 7.0.0
+ * @version 7.1.0
  * @license MIT
  */
 
@@ -76,7 +77,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "7.0.0";
+const VERSION = "7.1.0";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -134,6 +135,9 @@ const prewarmSessions = new Map();
 const agentConfigCache = new Map();
 const tenantCallCounts = new Map();
 const ipRequestCounts = new Map();
+
+// v7.1.0: Interpreter cross-routing â€” tracks linked sessions by prepId
+const interpreterPartners = new Map(); // prepId â†’ { sessionA, sessionB }
 
 // Ringback silence frame (8kHz ulaw, ~100ms)
 const RINGBACK_SILENCE_FRAME = Buffer.alloc(800).toString("base64");
@@ -682,6 +686,16 @@ class SessionManager {
       if (session.autoHangupTimer) clearTimeout(session.autoHangupTimer);
       if (session.greetingTimer) clearTimeout(session.greetingTimer);
       if (session.ringbackInterval) clearInterval(session.ringbackInterval);
+      // v7.1.0: Clean up interpreter partner references
+      if (session.interpreterPartner) {
+        session.interpreterPartner.interpreterPartner = null;
+        logger.info("Interpreter partner unlinked", { callSid: session.callSid });
+      }
+      // Clean up interpreterPartners map
+      if (session.prepId && interpreterPartners.has(session.prepId)) {
+        interpreterPartners.delete(session.prepId);
+      }
+
       if (session.companyId) {
         RateLimiter.decrementTenantCalls(session.companyId);
       }
@@ -2024,18 +2038,40 @@ class OpenAIHandler {
           break;
 
         case "response.audio.delta":
-          if (session.twilioWs?.readyState === WebSocket.OPEN && session.streamSid) {
+          // v7.1.0: Interpreter cross-routing
+          // In interpreter mode, send translated audio to the PARTNER's stream
+          let targetWs = session.twilioWs;
+          let targetStreamSid = session.streamSid;
+
+          if (session.interpreterPartner) {
+            const partner = session.interpreterPartner;
+            if (partner.twilioWs?.readyState === WebSocket.OPEN && partner.streamSid) {
+              targetWs = partner.twilioWs;
+              targetStreamSid = partner.streamSid;
+            } else {
+              logger.warn("Interpreter partner stream not ready", {
+                callSid: session.callSid,
+                partnerCallSid: partner.callSid,
+                partnerWsReady: partner.twilioWs?.readyState === WebSocket.OPEN,
+                partnerStreamSid: !!partner.streamSid
+              });
+            }
+          }
+
+          if (targetWs?.readyState === WebSocket.OPEN && targetStreamSid) {
             if (!session.firstAudioSent) {
               session.firstAudioSent = true;
               session.metrics.t_first_audio_sent = Date.now();
               TwilioHandler.stopRingback(session);
               logger.info("First audio sent", {
                 callSid: session.callSid,
+                crossRouted: !!session.interpreterPartner,
+                targetCallSid: session.interpreterPartner?.callSid || session.callSid,
                 latencyMs: session.metrics.t_first_audio_sent - (session.metrics.t_stream_start || session.metrics.t_session_created)
               });
             }
-            session.twilioWs.send(JSON.stringify({
-              event: "media", streamSid: session.streamSid,
+            targetWs.send(JSON.stringify({
+              event: "media", streamSid: targetStreamSid,
               media: { payload: event.delta }
             }));
           }
@@ -2331,6 +2367,10 @@ class TwilioHandler {
     const forceNewSession = params.forceNewSession === "true" || params.force_new_session === "true";
     const skipPrewarm = params.skipPrewarm === "true" || params.skip_prewarm === "true";
 
+    // v7.1.0: Interpreter leg identification
+    const interpreterLeg = params.interpreterLeg || params.interpreter_leg || null;
+    if (interpreterLeg) session.interpreterLeg = interpreterLeg;
+
     logger.info("TwiML params", { dynB64: !!dynB64, fmB64: !!fmB64, prepId, forceNew: forceNewSession, skipPrewarm });
 
     if (dynB64) {
@@ -2473,6 +2513,40 @@ OUTPUT FORMAT:
 
       // Use appropriate voice for the customer side (they hear the translation)
       session.config.voice = VoiceMapper.mapToOpenAI(session.ttsVoiceCustomer || session.config.voice || DEFAULT_VOICE);
+
+      // v7.1.0: INTERPRETER CROSS-ROUTING SETUP
+      // Link interpreter sessions that share the same prepId
+      const interpreterPrepId = session.prepId || prepId;
+      if (interpreterPrepId) {
+        if (interpreterPartners.has(interpreterPrepId)) {
+          // Second leg connecting â€” link both sessions as partners
+          const partnerData = interpreterPartners.get(interpreterPrepId);
+          const partnerSession = partnerData.sessionA;
+
+          // Cross-link: each session points to the other
+          session.interpreterPartner = partnerSession;
+          partnerSession.interpreterPartner = session;
+
+          partnerData.sessionB = session;
+
+          logger.info("Interpreter partners linked", {
+            prepId: interpreterPrepId,
+            sessionA_callSid: partnerSession.callSid,
+            sessionA_leg: partnerSession.interpreterLeg || "agent",
+            sessionB_callSid: session.callSid,
+            sessionB_leg: session.interpreterLeg || "customer",
+          });
+        } else {
+          // First leg connecting â€” register and wait for partner
+          interpreterPartners.set(interpreterPrepId, { sessionA: session, sessionB: null });
+
+          logger.info("Interpreter session registered, waiting for partner", {
+            prepId: interpreterPrepId,
+            callSid: session.callSid,
+            leg: session.interpreterLeg || "agent",
+          });
+        }
+      }
     }
 
     // Register session by callSid and create call record
@@ -3099,6 +3173,12 @@ server.listen(PORT, () => {
 â•‘  âœ… Dynamic temperature / max_tokens                      â•‘
 â•‘  âœ… Cache invalidation endpoint                           â•‘
 â•‘  âœ… Real-Time Interpreter mode (ESâ†”EN)                    â•‘
+â•‘                                                           â•‘
+â•‘  NEW v7.1.0 Features:                                     â•‘
+â•‘  âœ… Interpreter cross-routing (dual-leg audio bridge)     â•‘
+â•‘  âœ… interpreterPartners Map for session linking           â•‘
+â•‘  âœ… interpreterLeg param parsing (agent/customer)         â•‘
+â•‘  âœ… Partner cleanup on session delete                     â•‘
 â•‘                                                           â•‘
 â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
   `);
