@@ -1,9 +1,9 @@
 /**
  * ============================================================
- * VOICE GATEWAY v7.1.0 â€” ENTERPRISE EDITION (Blue Core Ready)
+ * VOICE GATEWAY v7.2.0 â€” ENTERPRISE EDITION (Blue Core Ready)
  * ============================================================
  *
- * Complete OOP architecture based on v7.0.0 with v7.1.0 fixes:
+ * Complete OOP architecture based on v7.0.0 with v7.1.0 + v7.2.0 fixes:
  * - v7.0.0 Full codebase (27 classes, resilience, observability)
  * - v7.1.0 FIX: Interpreter cross-routing for dual-leg calls
  *   â†’ Audio from Session A now routes to Session B's Twilio stream
@@ -12,11 +12,14 @@
  * - v7.1.0 NEW: interpreterPartners Map for session linking by prepId
  * - v7.1.0 NEW: interpreterLeg param (agent/customer) from TwiML
  * - v7.1.0 NEW: Partner cleanup on session delete
+ * - v7.2.0 FIX: Interpreter mode now uses ZERO tools (no CRM/scheduling loaded)
+ * - v7.2.0 FIX: Greeting suppressed in interpreter mode (skipGreeting respected)
+ * - v7.2.0 FIX: buildToolDefinitions respects empty tools array []
  *
  *
  * ARCHITECTURE: 10 clearly separated sections with full OOP encapsulation.
  *
- * CLASSES (27 â€” 22 original + 5 new):
+ * CLASSES (27 Ã¢â‚¬â€ 22 original + 5 new):
  *   Utilities:    Logger, Validator, Parser
  *   Resilience:   RetryManager, CircuitBreaker, RateLimiter
  *   State:        SessionManager
@@ -77,7 +80,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "7.1.0";
+const VERSION = "7.2.0";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -136,8 +139,8 @@ const agentConfigCache = new Map();
 const tenantCallCounts = new Map();
 const ipRequestCounts = new Map();
 
-// v7.1.0: Interpreter cross-routing â€” tracks linked sessions by prepId
-const interpreterPartners = new Map(); // prepId â†’ { sessionA, sessionB }
+// v7.1.0: Interpreter cross-routing Ã¢â‚¬â€ tracks linked sessions by prepId
+const interpreterPartners = new Map(); // prepId Ã¢â€ â€™ { sessionA, sessionB }
 
 // Ringback silence frame (8kHz ulaw, ~100ms)
 const RINGBACK_SILENCE_FRAME = Buffer.alloc(800).toString("base64");
@@ -153,8 +156,8 @@ const SUPPORTED_LANGUAGES = {
   es: {
     name: "Spanish",
     patterns: [
-      /\b(hola|buenos dÃ­as|gracias|por favor|cÃ³mo estÃ¡s|sÃ­|no)\b/i,
-      /[Ã±Ã¡Ã©Ã­Ã³Ãº]/
+      /\b(hola|buenos dÃƒÂ­as|gracias|por favor|cÃƒÂ³mo estÃƒÂ¡s|sÃƒÂ­|no)\b/i,
+      /[ÃƒÂ±ÃƒÂ¡ÃƒÂ©ÃƒÂ­ÃƒÂ³ÃƒÂº]/
     ]
   },
   en: {
@@ -169,22 +172,22 @@ const SUPPORTED_LANGUAGES = {
 const VOICEMAIL_PATTERNS = [
   /leave\s+(a\s+)?message/i, /deja\s+(tu\s+)?mensaje/i,
   /grabe\s+su\s+mensaje/i, /after\s+the\s+(beep|tone)/i,
-  /at\s+the\s+tone/i, /no\s+estÃ¡?\s+disponible/i,
+  /at\s+the\s+tone/i, /no\s+estÃƒÂ¡?\s+disponible/i,
   /voicemail/i, /record\s+(your\s+)?message/i,
-  /press(ione)?\s+\d/i, /marque\s+\d/i, /opci[oÃ³]n\s+\d/i,
+  /press(ione)?\s+\d/i, /marque\s+\d/i, /opci[oÃƒÂ³]n\s+\d/i,
   /para\s+.*\s+presione/i, /if\s+you\s+know\s+your\s+party/i,
   /mailbox\s+is\s+full/i, /deje(\s+su)?\s+mensaje/i,
-  /al\s+escuchar\s+el\s+tono/i, /buz[oÃ³]n\s+de\s+voz/i,
+  /al\s+escuchar\s+el\s+tono/i, /buz[oÃƒÂ³]n\s+de\s+voz/i,
   /please\s+leave\s+your\s+message/i, /not\s+available.*leave.*message/i
 ];
 
 // Goodbye detection patterns
 const GOODBYE_PATTERNS = [
   /you're welcome/i, /de nada/i,
-  /have a (great|good|wonderful|nice) day/i, /que tengas? (un )?buen dÃ­a/i,
-  /take care/i, /cuÃ­date/i,
-  /goodbye/i, /adiÃ³s/i, /hasta luego/i,
-  /if you need anything else/i, /si necesitas? algo mÃ¡s/i,
+  /have a (great|good|wonderful|nice) day/i, /que tengas? (un )?buen dÃƒÂ­a/i,
+  /take care/i, /cuÃƒÂ­date/i,
+  /goodbye/i, /adiÃƒÂ³s/i, /hasta luego/i,
+  /if you need anything else/i, /si necesitas? algo mÃƒÂ¡s/i,
   /thanks for calling/i, /gracias por llamar/i,
   /bye/i, /chao/i
 ];
@@ -377,7 +380,7 @@ requireEnv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_KEY);
 requireEnv("OPENAI_API_KEY", OPENAI_API_KEY);
 
 if (!VOICE_GATEWAY_TOKEN) {
-  logger.warn("VOICE_GATEWAY_TOKEN not set â€” prewarm/sessions endpoints will be unprotected");
+  logger.warn("VOICE_GATEWAY_TOKEN not set Ã¢â‚¬â€ prewarm/sessions endpoints will be unprotected");
 }
 
 logger.info("Voice Gateway starting", {
@@ -862,7 +865,7 @@ class SupabaseClient {
   }
 
   /**
-   * Multi-source agent config loader: agents_new â†’ autoprompt â†’ ai_agents â†’ bc_agents
+   * Multi-source agent config loader: agents_new Ã¢â€ â€™ autoprompt Ã¢â€ â€™ ai_agents Ã¢â€ â€™ bc_agents
    * ENHANCED v7: Also loads ai_model, ai_temperature, ai_max_tokens, stt_*, voice_provider, elevenlabs_* from bc_agents
    */
   static async loadAgentConfig(agentId, companyId) {
@@ -928,7 +931,7 @@ class SupabaseClient {
         }
       }
 
-      // 4. Try bc_agents (Blue Core sandbox) â€” ENHANCED v7 with extended fields
+      // 4. Try bc_agents (Blue Core sandbox) Ã¢â‚¬â€ ENHANCED v7 with extended fields
       // ALWAYS check bc_agents for voice/config overrides, even if prompt was loaded from autoprompt
       {
         const bcRes = await this.request("bc_agents?id=eq." + agentId + "&select=*");
@@ -999,7 +1002,7 @@ class SupabaseClient {
   }
 
   /**
-   * Load prep session from DB: call_prep_sessions â†’ bc_call_prep_sessions
+   * Load prep session from DB: call_prep_sessions Ã¢â€ â€™ bc_call_prep_sessions
    */
   static async loadPrepSession(prepId, session) {
     logger.info("Loading prep session from DB", { prepId });
@@ -1384,8 +1387,8 @@ class BusinessNameDetector {
     "homes", "home", "signature", "network", "grill", "bar", "cafe", "coffee", "pizza",
     "tacos", "food", "express", "delivery", "moving", "movers", "storage", "rental",
     "academy", "school", "training", "center", "centre", "club", "foundation",
-    "taller", "tienda", "peluquerÃ­a", "barberÃ­a", "restaurante", "clÃ­nica", "estudio",
-    "servicios", "constructora", "mecÃ¡nica", "carpinterÃ­a", "panaderÃ­a",
+    "taller", "tienda", "peluquerÃƒÂ­a", "barberÃƒÂ­a", "restaurante", "clÃƒÂ­nica", "estudio",
+    "servicios", "constructora", "mecÃƒÂ¡nica", "carpinterÃƒÂ­a", "panaderÃƒÂ­a",
     "dominicanos", "mexicanos", "latinos", "hispanos",
     "the ", " & ", " and ", " y ", "realty", "real estate", "insurance",
     "marketing", "media", "design", "tech", "technology", "digital", "professional"
@@ -1394,7 +1397,7 @@ class BusinessNameDetector {
   static PATTERNS = [/\|/, /\b(rd|llc|inc|corp)\b/i, /\d{3,}/, /^[A-Z\s&]+$/];
 
   static PLACEHOLDER_NAMES = [
-    "unknown", "desconocido", "anÃ³nimo", "anonimo", "anonymous",
+    "unknown", "desconocido", "anÃƒÂ³nimo", "anonimo", "anonymous",
     "null", "undefined", "n/a", "na", "none", "no name", "sin nombre",
     "cliente", "customer", "user", "usuario", "contact", "contacto",
     "no disponible", "not available", "pending", "pendiente"
@@ -1603,7 +1606,7 @@ class ToolDeduplicator {
  */
 class PromptBuilder {
   static build(session, config) {
-    // Full dynamic mode â€” replace entire prompt
+    // Full dynamic mode Ã¢â‚¬â€ replace entire prompt
     if (session.dynamicInstructions && session.dynamicInstructionsMode === "full") {
       // NEW v7: Even in full mode, append playbook if available
       let prompt = session.dynamicInstructions;
@@ -1629,7 +1632,7 @@ class PromptBuilder {
 
     // Demo mode
     if (session.isDemoCall) {
-      parts.push("## DEMO MODE â€” NO SCHEDULING");
+      parts.push("## DEMO MODE Ã¢â‚¬â€ NO SCHEDULING");
       parts.push("Redirect to self-serve signup link instead.");
       parts.push("");
     }
@@ -1653,9 +1656,9 @@ class PromptBuilder {
 
     // Call direction
     if (isOutbound) {
-      parts.push("CALL DIRECTION: OUTBOUND â€” YOU initiated this call. Do NOT ask 'how can I help you?'");
+      parts.push("CALL DIRECTION: OUTBOUND Ã¢â‚¬â€ YOU initiated this call. Do NOT ask 'how can I help you?'");
     } else {
-      parts.push("CALL DIRECTION: INBOUND â€” Customer called YOU. Greet and ask how you can help.");
+      parts.push("CALL DIRECTION: INBOUND Ã¢â‚¬â€ Customer called YOU. Greet and ask how you can help.");
     }
 
     // Contact info
@@ -1666,8 +1669,8 @@ class PromptBuilder {
     }
 
     // CRM rules
-    let crmRules = "\nCRM RULES: Identify contact â†’ create_lead if interest â†’ ";
-    if (!session.isDemoCall) crmRules += "schedule_appointment if requested â†’ ";
+    let crmRules = "\nCRM RULES: Identify contact Ã¢â€ â€™ create_lead if interest Ã¢â€ â€™ ";
+    if (!session.isDemoCall) crmRules += "schedule_appointment if requested Ã¢â€ â€™ ";
     crmRules += "take_note before ending.";
     parts.push(crmRules);
 
@@ -1690,21 +1693,21 @@ class PromptBuilder {
     pbParts.push(`## PLAYBOOK (v${playbook.version || 1})`);
 
     if (playbook.openingScript) {
-      pbParts.push(`### GUIÃ“N DE APERTURA\n${playbook.openingScript}`);
+      pbParts.push(`### GUIÃƒâ€œN DE APERTURA\n${playbook.openingScript}`);
     }
 
     if (playbook.qualifyingQuestions?.length > 0) {
       const qs = playbook.qualifyingQuestions
         .map((q, i) => `${i + 1}. ${typeof q === "string" ? q : q.question || JSON.stringify(q)}`)
         .join("\n");
-      pbParts.push(`### PREGUNTAS DE CALIFICACIÃ“N\n${qs}`);
+      pbParts.push(`### PREGUNTAS DE CALIFICACIÃƒâ€œN\n${qs}`);
     }
 
     if (playbook.objectionHandlers?.length > 0) {
       const ohs = playbook.objectionHandlers
         .map(oh => {
           if (typeof oh === "string") return `- ${oh}`;
-          return `- **ObjeciÃ³n:** ${oh.objection || oh.trigger || ""}\n  **Respuesta:** ${oh.response || oh.handler || ""}`;
+          return `- **ObjeciÃƒÂ³n:** ${oh.objection || oh.trigger || ""}\n  **Respuesta:** ${oh.response || oh.handler || ""}`;
         })
         .join("\n");
       pbParts.push(`### MANEJO DE OBJECIONES\n${ohs}`);
@@ -1844,7 +1847,7 @@ class ToolExecutor {
         type: "conversation.item.create",
         item: {
           type: "message", role: "system",
-          content: [{ type: "input_text", text: `[END CALL - MANDATORY GOODBYE] Say exactly: "${goodbye}" â€” Do NOT add anything else.` }]
+          content: [{ type: "input_text", text: `[END CALL - MANDATORY GOODBYE] Say exactly: "${goodbye}" Ã¢â‚¬â€ Do NOT add anything else.` }]
         }
       }));
       ResponseLockManager.sendResponseCreateSafe(
@@ -1907,6 +1910,12 @@ class ToolExecutor {
    * ENHANCED v7: Uses dynamic tools from bc_agent_tools if loaded, otherwise hardcoded defaults
    */
   static buildToolDefinitions(session, config) {
+    // v7.2.0: If dynamicTools is an empty array, return NO tools (interpreter/no-tools mode)
+    if (Array.isArray(session.dynamicTools) && session.dynamicTools.length === 0) {
+      logger.info("Using empty tool set (interpreter/no-tools mode)", { callSid: session.callSid });
+      return [];
+    }
+
     // NEW v7: If dynamic tools were loaded from DB, convert them to OpenAI format
     if (session.dynamicTools?.length > 0) {
       const tools = session.dynamicTools
@@ -2282,7 +2291,7 @@ class TwilioHandler {
           case "media":
             if (!session.twilioStreamReady) {
               session.twilioStreamReady = true;
-              logger.debug("First media received â€” twilioStreamReady", { callSid: session.callSid });
+              logger.debug("First media received Ã¢â‚¬â€ twilioStreamReady", { callSid: session.callSid });
               this.tryTriggerGreetingWhenReady(session);
             }
             if (session.openaiWs?.readyState === WebSocket.OPEN) {
@@ -2446,7 +2455,7 @@ class TwilioHandler {
       }
     } else {
       // ==================== COLD START ====================
-      logger.info("Cold start â€” no prewarm", { callSid: session.callSid });
+      logger.info("Cold start Ã¢â‚¬â€ no prewarm", { callSid: session.callSid });
       if (prepId) {
         session.prepId = prepId;
         await SupabaseClient.loadPrepSession(prepId, session);
@@ -2517,6 +2526,9 @@ OUTPUT FORMAT:
       session.dynamicFirstMessage = null;
       session.skipGreeting = true;
 
+      // v7.2.0: Force empty tools for interpreter mode (no CRM, scheduling, etc.)
+      session.dynamicTools = [];
+
       // Use appropriate voice for the customer side (they hear the translation)
       session.config.voice = VoiceMapper.mapToOpenAI(session.ttsVoiceCustomer || session.config.voice || DEFAULT_VOICE);
 
@@ -2525,7 +2537,7 @@ OUTPUT FORMAT:
       const interpreterPrepId = session.prepId || prepId;
       if (interpreterPrepId) {
         if (interpreterPartners.has(interpreterPrepId)) {
-          // Second leg connecting â€” link both sessions as partners
+          // Second leg connecting Ã¢â‚¬â€ link both sessions as partners
           const partnerData = interpreterPartners.get(interpreterPrepId);
           const partnerSession = partnerData.sessionA;
 
@@ -2543,7 +2555,7 @@ OUTPUT FORMAT:
             sessionB_leg: session.interpreterLeg || "customer",
           });
         } else {
-          // First leg connecting â€” register and wait for partner
+          // First leg connecting Ã¢â‚¬â€ register and wait for partner
           interpreterPartners.set(interpreterPrepId, { sessionA: session, sessionB: null });
 
           logger.info("Interpreter session registered, waiting for partner", {
@@ -2601,6 +2613,14 @@ OUTPUT FORMAT:
 
   static _triggerGreeting(session) {
     if (session.greetingTriggered) return;
+
+    // v7.2.0: Skip greeting entirely in interpreter mode or when explicitly requested
+    if (session.skipGreeting) {
+      session.greetingTriggered = true;
+      logger.info("Greeting skipped (interpreter/skipGreeting mode)", { callSid: session.callSid });
+      return;
+    }
+
     session.greetingTriggered = true;
     this.stopRingback(session);
 
@@ -2616,7 +2636,7 @@ OUTPUT FORMAT:
         const company = session.config?.companyName || "";
         greeting = session.language === "en"
           ? `Hello! This is ${agentName || "a representative"}${company ? " from " + company : ""}. Do you have a moment to talk?`
-          : `Â¡Hola! Soy ${agentName || "un representante"}${company ? " de " + company : ""}. Â¿Tiene un momento para hablar?`;
+          : `Ã‚Â¡Hola! Soy ${agentName || "un representante"}${company ? " de " + company : ""}. Ã‚Â¿Tiene un momento para hablar?`;
       }
 
       if (greeting) {
@@ -2652,7 +2672,7 @@ OUTPUT FORMAT:
         const company = session.config?.companyName || "";
         greeting = session.language === "en"
           ? `Hello! Thank you for calling${company ? " " + company : ""}. How can I help you today?`
-          : `Â¡Hola! Gracias por llamar${company ? " a " + company : ""}. Â¿En quÃ© puedo ayudarle hoy?`;
+          : `Ã‚Â¡Hola! Gracias por llamar${company ? " a " + company : ""}. Ã‚Â¿En quÃƒÂ© puedo ayudarle hoy?`;
       }
 
       if (greeting) {
@@ -2894,7 +2914,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
-    // GET / â€” Basic info
+    // GET / Ã¢â‚¬â€ Basic info
     if (path === "/" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ service: "Voice Gateway", version: VERSION, status: "running" }));
@@ -3104,7 +3124,7 @@ const server = http.createServer(async (req, res) => {
                 success: true,
                 prep_id: prepId,
                 session_ready: false,
-                note: "Timeout â€” stored but not fully ready"
+                note: "Timeout Ã¢â‚¬â€ stored but not fully ready"
               }));
             }
           }, SESSION_UPDATE_TIMEOUT_MS);
@@ -3153,47 +3173,47 @@ server.listen(PORT, () => {
   logger.info("Voice Gateway started", { version: VERSION, port: PORT, pid: process.pid });
 
   console.log(`
-â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
-â•‘                                                           â•‘
-â•‘  VOICE GATEWAY v${VERSION} â€” ENTERPRISE EDITION            â•‘
-â•‘                                                           â•‘
-â•‘  ðŸš€ Server running on port ${PORT}                          â•‘
-â•‘  ðŸ“Š Metrics: http://localhost:${PORT}/metrics               â•‘
-â•‘  â¤ï¸  Health:  http://localhost:${PORT}/health                â•‘
-â•‘  ðŸ”Œ WebSocket: ws://localhost:${PORT}/twilio-stream          â•‘
-â•‘                                                           â•‘
-â•‘  Architecture: 27 OOP Classes (10 sections)               â•‘
-â•‘  âœ… Multi-tenant (agents_new + bc_agents)                 â•‘
-â•‘  âœ… Circuit breakers & exponential backoff                â•‘
-â•‘  âœ… Prewarm with forceNewSession/skipPrewarm              â•‘
-â•‘  âœ… Dynamic instructions (full/addon) + Base64            â•‘
-â•‘  âœ… Voicemail/IVR detection + auto-hangup                 â•‘
-â•‘  âœ… Spam filtering & rate limiting                        â•‘
-â•‘  âœ… Tool deduplication & response locking                 â•‘
-â•‘  âœ… Business name detection                               â•‘
-â•‘  âœ… Webhook support for post-call events                  â•‘
-â•‘  âœ… Structured JSON logging + metrics                     â•‘
-â•‘  âœ… Graceful shutdown + fatal error handling               â•‘
-â•‘  âœ… Full exports for testing                              â•‘
-â•‘                                                           â•‘
-â•‘  NEW v7.0.0 Features:                                     â•‘
-â•‘  âœ… Dynamic Tools from DB (bc_agent_tools)                â•‘
-â•‘  âœ… ElevenLabs TTS (stability, style, speed)              â•‘
-â•‘  âœ… Playbooks injection (bc_agent_playbooks)              â•‘
-â•‘  âœ… Tool call logging (persistent)                        â•‘
-â•‘  âœ… Configurable STT (provider, language, model)          â•‘
-â•‘  âœ… Configurable AI model (from bc_agents)                â•‘
-â•‘  âœ… Dynamic temperature / max_tokens                      â•‘
-â•‘  âœ… Cache invalidation endpoint                           â•‘
-â•‘  âœ… Real-Time Interpreter mode (ESâ†”EN)                    â•‘
-â•‘                                                           â•‘
-â•‘  NEW v7.1.0 Features:                                     â•‘
-â•‘  âœ… Interpreter cross-routing (dual-leg audio bridge)     â•‘
-â•‘  âœ… interpreterPartners Map for session linking           â•‘
-â•‘  âœ… interpreterLeg param parsing (agent/customer)         â•‘
-â•‘  âœ… Partner cleanup on session delete                     â•‘
-â•‘                                                           â•‘
-â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+Ã¢â€¢â€Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢â€”
+Ã¢â€¢â€˜                                                           Ã¢â€¢â€˜
+Ã¢â€¢â€˜  VOICE GATEWAY v${VERSION} Ã¢â‚¬â€ ENTERPRISE EDITION            Ã¢â€¢â€˜
+Ã¢â€¢â€˜                                                           Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã°Å¸Å¡â‚¬ Server running on port ${PORT}                          Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã°Å¸â€œÅ  Metrics: http://localhost:${PORT}/metrics               Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢ÂÂ¤Ã¯Â¸Â  Health:  http://localhost:${PORT}/health                Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã°Å¸â€Å’ WebSocket: ws://localhost:${PORT}/twilio-stream          Ã¢â€¢â€˜
+Ã¢â€¢â€˜                                                           Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Architecture: 27 OOP Classes (10 sections)               Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Multi-tenant (agents_new + bc_agents)                 Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Circuit breakers & exponential backoff                Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Prewarm with forceNewSession/skipPrewarm              Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Dynamic instructions (full/addon) + Base64            Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Voicemail/IVR detection + auto-hangup                 Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Spam filtering & rate limiting                        Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Tool deduplication & response locking                 Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Business name detection                               Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Webhook support for post-call events                  Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Structured JSON logging + metrics                     Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Graceful shutdown + fatal error handling               Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Full exports for testing                              Ã¢â€¢â€˜
+Ã¢â€¢â€˜                                                           Ã¢â€¢â€˜
+Ã¢â€¢â€˜  NEW v7.0.0 Features:                                     Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Dynamic Tools from DB (bc_agent_tools)                Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ ElevenLabs TTS (stability, style, speed)              Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Playbooks injection (bc_agent_playbooks)              Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Tool call logging (persistent)                        Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Configurable STT (provider, language, model)          Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Configurable AI model (from bc_agents)                Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Dynamic temperature / max_tokens                      Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Cache invalidation endpoint                           Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Real-Time Interpreter mode (ESÃ¢â€ â€EN)                    Ã¢â€¢â€˜
+Ã¢â€¢â€˜                                                           Ã¢â€¢â€˜
+Ã¢â€¢â€˜  NEW v7.1.0 Features:                                     Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Interpreter cross-routing (dual-leg audio bridge)     Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ interpreterPartners Map for session linking           Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ interpreterLeg param parsing (agent/customer)         Ã¢â€¢â€˜
+Ã¢â€¢â€˜  Ã¢Å“â€¦ Partner cleanup on session delete                     Ã¢â€¢â€˜
+Ã¢â€¢â€˜                                                           Ã¢â€¢â€˜
+Ã¢â€¢Å¡Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
   `);
 });
 
