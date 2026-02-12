@@ -955,7 +955,7 @@ class SupabaseClient {
           config.elevenlabsSpeed = bcAgent.elevenlabs_speed ?? 1.0;
           config.elevenlabsModelId = bcAgent.elevenlabs_model_id || "eleven_turbo_v2_5";
           config.aiModel = bcAgent.ai_model || OPENAI_REALTIME_MODEL;
-          config.aiTemperature = bcAgent.ai_temperature ?? 0.8;
+          config.aiTemperature = Math.max(0.6, bcAgent.ai_temperature ?? 0.8); // v7.2.0: OpenAI Realtime min is 0.6
           config.aiMaxTokens = bcAgent.ai_max_tokens ?? 4096;
           config.sttProvider = bcAgent.stt_provider || "openai";
           config.sttLanguage = bcAgent.stt_language || config.language;
@@ -2195,7 +2195,7 @@ class OpenAIHandler {
       },
       tools,
       // NEW v7: Dynamic temperature and max_tokens
-      temperature: config.aiTemperature ?? 0.8,
+      temperature: Math.max(0.6, config.aiTemperature ?? 0.8), // v7.2.0: Floor to 0.6 (OpenAI Realtime minimum)
       max_response_output_tokens: config.aiMaxTokens ?? 4096
     };
 
